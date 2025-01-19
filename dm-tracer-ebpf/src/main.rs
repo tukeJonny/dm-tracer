@@ -18,6 +18,8 @@ use dm_tracer_common::{
     dm_ioctl_commands::DmIoctlCommand,
 };
 
+// FIXME: 雑なエラーハンドリングを見直す
+
 // ioctlのID管理をするアトミックカウンタ
 // 要素数１のArrayで管理する
 #[map(name = "EVENT_ID")]
@@ -25,14 +27,16 @@ static mut EVENT_ID: Array<u64> = Array::with_max_entries(1, 0);
 
 unsafe fn issue_event_id() -> Result<u64, u32> {
     let current = EVENT_ID.get_ptr_mut(0).ok_or(1u32)?;
-    *current = *current.wrapping_add(1);
+    let next = *current + 1;
+    *current = next;
     Ok(*current)
 }
 
-// FIXME: アクセス競合によるパフォーマンスペナルティが大きい
+// NOTE: アクセス競合によるパフォーマンスペナルティが大きい
 #[map(name = "INFLIGHT_EVENTS")]
 static mut INFLIGHT_EVENTS: HashMap<u64, Event> = HashMap::with_max_entries(1024, 0);
 
+// PIDからioctlのIDへ変換するためのマップ
 #[map(name = "PID_TO_ID")]
 static mut PID_TO_ID: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
 
@@ -85,6 +89,7 @@ fn try_trace_sys_enter_ioctl(ctx: TracePointContext) -> Result<u32, u32> {
             Err(n) => return Err(n as u32),
         }
     };
+    info!(&ctx, "arg= {}", arg);
     let dm_ctl = unsafe {
         match bpf_probe_read_user(arg as *const dm_ioctl) {
             Ok(data) => data,
@@ -94,13 +99,17 @@ fn try_trace_sys_enter_ioctl(ctx: TracePointContext) -> Result<u32, u32> {
 
     let event_id = unsafe { issue_event_id()? };
     let pid = bpf_get_current_pid_tgid();
-    let comm = bpf_get_current_comm().unwrap();
-    let Some(cmd) = DmIoctlCommand::from_u32(command_number as u32) else { return Err(command_number as u32) };
+    let Ok(comm) = bpf_get_current_comm() else {
+        return Err(pid as u32)
+    };
+    let Some(cmd) = DmIoctlCommand::from_u32(command_number as u32) else {
+        return Err(command_number as u32)
+    };
     let event = Event::new(event_id, pid, comm, cmd);
 
     unsafe {
-        INFLIGHT_EVENTS.insert(&event_id, &event, 0).unwrap();
-        PID_TO_ID.insert(&pid, &event_id, 0).unwrap();
+        INFLIGHT_EVENTS.insert(&event_id, &event, 0);
+        PID_TO_ID.insert(&pid, &event_id, 0);
     }
 
     info!(&ctx, "[{}] tracepoint sys_enter_ioctl called", command_number);
@@ -140,8 +149,6 @@ pub fn trace_sys_exit_ioctl(ctx: TracePointContext) -> u32 {
     }
 }
 
-// pid, comm => eventのマップはあってもいいかも？
-
 /*
 name: sys_exit_ioctl
 ID: 821
@@ -173,9 +180,11 @@ fn try_trace_sys_exit_ioctl(ctx: TracePointContext) -> Result<u32, u32> {
         }
     };
 
+    // FIXME: PerfEventArrayに結果を突っ込んで、ユーザランドから結果を操作できるようにする
+
     unsafe {
-        INFLIGHT_EVENTS.remove(&event_id).unwrap();
-        PID_TO_ID.remove(&pid).unwrap();
+        INFLIGHT_EVENTS.remove(&event_id);
+        PID_TO_ID.remove(&pid);
     }
 
     info!(&ctx, "tracepoint sys_exit_ioctl called: {}", ret);
